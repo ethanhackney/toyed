@@ -26,6 +26,11 @@ enum {
         ENTER_INSERT_MODE       = 'i',
 };
 
+struct row {
+        size_t size;
+        char *data;
+};
+
 static void enable_raw_mode(void);
 static void disable_raw_mode(void);
 static void read_keypress(void);
@@ -43,6 +48,8 @@ static void winbuf_free(void);
 static void winbuf_flush(void);
 static void move(char key);
 static void open_file(char *path);
+static void add_row(char *row, size_t len);
+static void scroll(void);
 
 static struct termios orig_termios;
 static int nr_rows;
@@ -53,9 +60,10 @@ static size_t winbufleng;
 static int cursor_row;
 static int cursor_col;
 static int mode = MODE_NORMAL;
-static char *file_row;
-static int file_rowsize;
-static int nr_lines_in_file;
+static struct row *file_rows;
+static int file_nr_rows;
+static int file_nr_alloc;
+static int file_row_offset;
 
 int
 main(int argc, char **argv)
@@ -158,13 +166,15 @@ refresh(void)
 {
         char cursor[32];
 
+        scroll();
+
         winbuf_init();
         winbuf_puts("\x1b[?25l");
         winbuf_puts("\x1b[H");
         draw();
 
         snprintf(cursor, sizeof(cursor), "\x1b[%d;%dH",
-                        cursor_row + 1, cursor_col + 1);
+                        (cursor_row - file_row_offset) + 1, cursor_col + 1);
         winbuf_puts(cursor);
 
         winbuf_puts("\x1b[?25h");
@@ -209,13 +219,14 @@ draw(void)
         int row;
 
         for (row = 0; row < nr_rows; row++) {
-                if (row >= nr_lines_in_file) {
+                int file_row = file_row_offset + row;
+                if (file_row >= file_nr_rows) {
                         winbuf_puts("~");
                 } else {
-                        len = file_rowsize;
+                        len = file_rows[file_row].size;
                         if (len > nr_cols)
                                 len = nr_cols;
-                        winbuf_puts(file_row);
+                        winbuf_puts(file_rows[file_row].data);
                 }
 
                 winbuf_puts("\x1b[K");
@@ -298,7 +309,7 @@ move(char key)
                         cursor_row--;
                 break;
         case MOVE_DOWN:
-                if (cursor_row < nr_rows)
+                if (cursor_row < file_nr_rows)
                         cursor_row++;
                 break;
         }
@@ -317,23 +328,52 @@ open_file(char *path)
                 fatal(EX_SOFTWARE, "open_file(): fopen()");
 
         linecap = 0;
-        linelen = getline(&line, &linecap, fp);
-        if (linelen != -1) {
+        while ((linelen = getline(&line, &linecap, fp)) != -1) {
                 end = line[linelen - 1];
                 if (end == '\n' || end == '\r')
                         line[--linelen] = '\0';
-
-                file_rowsize = linelen;
-                file_row = malloc(linelen + 1);
-                if (!file_row)
-                        fatal(EX_SOFTWARE, "open_file(): malloc()");
-
-                memcpy(file_row, line, linelen);
-                file_row[linelen] = '\0';
-                nr_lines_in_file = 1;
+                add_row(line, linelen);
         }
         free(line);
 
         if (fclose(fp))
                 fatal(EX_SOFTWARE, "open_file(): fclose()");
+
+        file_row_offset = 0;
+}
+
+static void
+add_row(char *row, size_t len)
+{
+        char *dup;
+
+        dup = strdup(row);
+        if (!dup)
+                err(EX_SOFTWARE, "add_row(): strdup()");
+
+        if (file_nr_rows == file_nr_alloc) {
+                if (!file_nr_alloc)
+                        file_nr_alloc = 1;
+                else
+                        file_nr_alloc *= 2;
+
+                file_rows = realloc(file_rows,
+                                sizeof(*file_rows) * file_nr_alloc);
+                if (!file_rows)
+                        err(EX_SOFTWARE, "add_row(): realloc()");
+        }
+
+        file_rows[file_nr_rows].data = dup;
+        file_rows[file_nr_rows].size = len;
+        file_nr_rows++;
+}
+
+static void
+scroll(void)
+{
+        if (cursor_row < file_row_offset)
+                file_row_offset = cursor_row;
+
+        if (cursor_row >= file_row_offset + nr_rows)
+                file_row_offset = cursor_row - nr_rows + 1;
 }
